@@ -297,19 +297,15 @@ fn extract_model(output: &str) -> Option<String> {
     for i in 0..lines.len() {
         let line = lines[i].trim();
         if line.starts_with("(define-fun") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                let name = parts[1];
-                if parts.len() >= 5 {
-                    let val = parts[parts.len() - 1].trim_end_matches(')');
-                    if !val.is_empty() && val != "(" && val != "()" {
-                        assignments.push(format!("{name}={val}"));
-                        continue;
-                    }
+            if let Some((name, inline)) = parse_define_fun(line) {
+                if let Some(val) = inline {
+                    assignments.push(format!("{name}={val}"));
+                    continue;
                 }
+                // Value is on the next line; strip the single paren closing define-fun.
                 if i + 1 < lines.len() {
                     let next = lines[i + 1].trim();
-                    let val = next.trim_end_matches(')');
+                    let val = next.strip_suffix(')').unwrap_or(next);
                     if !val.is_empty() && val != "(" {
                         assignments.push(format!("{name}={val}"));
                     }
@@ -317,5 +313,133 @@ fn extract_model(output: &str) -> Option<String> {
             }
         }
     }
-    if assignments.is_empty() { None } else { Some(assignments.join(" ")) }
+    if assignments.is_empty() {
+        None
+    } else {
+        Some(assignments.join(" "))
+    }
+}
+
+/// Parse `(define-fun <name> () <sort> [<value>])` into (name, inline value).
+///
+/// Only constants (empty arg list) are handled; functions return None.
+/// A parenthesized sort such as `(_ BitVec 8)` is skipped by paren matching,
+/// so its parameters are never mistaken for the value.
+fn parse_define_fun(line: &str) -> Option<(String, Option<String>)> {
+    let mut rest = line.trim().strip_prefix("(define-fun")?.trim_start();
+    let name_end = rest.find(char::is_whitespace)?;
+    let name = rest[..name_end].to_string();
+    rest = rest[name_end..].trim_start();
+    // Only constants carry a value; skip functions like (define-fun f ((x Int)) ...).
+    rest = rest.strip_prefix("()")?.trim_start();
+    // Skip the sort: either a plain token (Int, Bool, Real) or a
+    // parenthesized parameterized sort ((_ BitVec 8), (Array Int Int)).
+    if let Some(after) = rest.strip_prefix('(') {
+        let mut depth = 1;
+        let mut sort_end = None;
+        for (idx, ch) in after.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        sort_end = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        rest = after[sort_end? + 1..].trim_start();
+    } else {
+        let sort_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        rest = rest[sort_end..].trim_start();
+    }
+    // Whatever remains (minus the single paren closing define-fun) is the value.
+    let val = rest.strip_suffix(')').unwrap_or(rest).trim_end();
+    let value = if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    };
+    Some((name, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn int_inline_value() {
+        let out = "sat\n(\n  (define-fun x () Int 6)\n)\n";
+        assert_eq!(extract_model(out).as_deref(), Some("x=6"));
+    }
+
+    #[test]
+    fn int_next_line_value() {
+        let out = "sat\n(\n  (define-fun x () Int\n    6)\n)\n";
+        assert_eq!(extract_model(out).as_deref(), Some("x=6"));
+    }
+
+    #[test]
+    fn bool_value() {
+        let out = "sat\n(\n  (define-fun p () Bool\n    true)\n)\n";
+        assert_eq!(extract_model(out).as_deref(), Some("p=true"));
+    }
+
+    #[test]
+    fn bitvec_next_line_value_not_width() {
+        // Regression test: the old parser reported x=8 (the bit width).
+        let out = "sat\n(\n  (define-fun x () (_ BitVec 8)\n    #xff)\n)\n";
+        assert_eq!(extract_model(out).as_deref(), Some("x=#xff"));
+    }
+
+    #[test]
+    fn bitvec_inline_value() {
+        let out = "sat\n(\n  (define-fun x () (_ BitVec 8) #xff)\n)\n";
+        assert_eq!(extract_model(out).as_deref(), Some("x=#xff"));
+    }
+
+    #[test]
+    fn negative_int_keeps_parens() {
+        let out = "sat\n(\n  (define-fun x () Int\n    (- 3))\n)\n";
+        assert_eq!(extract_model(out).as_deref(), Some("x=(- 3)"));
+    }
+
+    #[test]
+    fn real_fraction_keeps_parens() {
+        let out = "sat\n(\n  (define-fun r () Real\n    (/ 5.0 2.0))\n)\n";
+        assert_eq!(extract_model(out).as_deref(), Some("r=(/ 5.0 2.0)"));
+    }
+
+    #[test]
+    fn algebraic_number_keeps_parens() {
+        let out = "sat\n(\n  (define-fun x () Real\n    (root-obj (+ (^ x 3) (- 2)) 1))\n)\n";
+        assert_eq!(
+            extract_model(out).as_deref(),
+            Some("x=(root-obj (+ (^ x 3) (- 2)) 1)")
+        );
+    }
+
+    #[test]
+    fn function_define_fun_is_skipped() {
+        let out = "sat\n(\n  (define-fun f ((x Int)) Int (+ x 1))\n)\n";
+        assert_eq!(extract_model(out), None);
+    }
+
+    #[test]
+    fn multi_sort_model() {
+        // Real output from Z3 4.16.0.
+        let out = "sat\n(\n  (define-fun r () Real\n    (/ 5.0 2.0))\n  (define-fun b () (_ BitVec 8)\n    #xff)\n  (define-fun x () Int\n    (- 3))\n  (define-fun p () Bool\n    true)\n)\n";
+        assert_eq!(
+            extract_model(out).as_deref(),
+            Some("r=(/ 5.0 2.0) b=#xff x=(- 3) p=true")
+        );
+    }
+
+    #[test]
+    fn unsat_has_no_model() {
+        let out = "unsat\n(error \"line 1 column 1: model is not available\")\n";
+        assert_eq!(extract_model(out), None);
+    }
 }
